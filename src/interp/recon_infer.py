@@ -270,73 +270,125 @@ print("vector_suffix", vector_suffix.shape)
 stage("unCLIP loaded")
 
 # ---- inference ----
+# Each shard of --shard_size images is saved on its own so a preempted job can --resume (per-image seeding keeps results identical).
 uniq_run = uniq_all[:args.max_images] if args.max_images > 0 else uniq_all
-all_blurryrecons, all_recons, all_clipvoxels, all_priorout = [], [], [], []
-all_predcaptions = []
-t_prior = t_cap = t_unclip = 0.0
-
-with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
-    for uniq_img in tqdm(uniq_run):
-        locs = np.where(test_images_idx == uniq_img)[0]
-        if len(locs) == 1:
-            locs = locs.repeat(3)
-        elif len(locs) == 2:
-            locs = locs.repeat(2)[:3]
-        assert len(locs) == 3
-        voxel = test_voxels[None, locs].to(device)  # 1, 3 reps, num_voxels
-
-        for rep in range(3):
-            backbone0, clip_voxels0, blurry_image_enc0 = model.backbone(model.ridge(voxel[:, [rep]], 0))
-            if rep == 0:
-                clip_voxels, backbone, blurry_image_enc = clip_voxels0, backbone0, blurry_image_enc0[0]
-            else:
-                clip_voxels += clip_voxels0
-                backbone += backbone0
-                blurry_image_enc += blurry_image_enc0[0]
-        clip_voxels /= 3
-        backbone /= 3
-        blurry_image_enc /= 3
-        all_clipvoxels.append(clip_voxels.cpu())
-
-        t = time.time()
-        torch.manual_seed(seed * 1000003 + int(uniq_img))
-        prior_out = model.diffusion_prior.p_sample_loop(backbone.shape,
-                                                        text_cond=dict(text_embed=backbone),
-                                                        cond_scale=1., timesteps=20)
-        t_prior += time.time() - t
-        all_priorout.append(prior_out.half().cpu())
-
-        t = time.time()
-        generated_ids = clip_text_model.generate(pixel_values=clip_convert(prior_out), max_length=20)
-        generated_caption = processor.batch_decode(generated_ids, skip_special_tokens=True)
-        all_predcaptions = np.hstack((all_predcaptions, generated_caption))
-        t_cap += time.time() - t
-
-        t = time.time()
-        torch.manual_seed(seed * 1000003 + int(uniq_img) + 1)
-        samples = utils.unclip_recon(prior_out[[0]], diffusion_engine, vector_suffix, num_samples=1)
-        all_recons.append(samples.cpu())
-        t_unclip += time.time() - t
-
-        if args.blurry_recon:
-            blurred_image = (autoenc.decode(blurry_image_enc / 0.18215).sample / 2 + 0.5).clamp(0, 1)
-            all_blurryrecons.append(blurred_image.cpu())
-        if len(all_recons) <= 5:
-            print(uniq_img, generated_caption, flush=True)
-
 n = len(uniq_run)
-print(f"per image: prior {t_prior / n:.2f}s, caption {t_cap / n:.2f}s, unCLIP {t_unclip / n:.2f}s", flush=True)
-print("peak GPU mem GB:", torch.cuda.max_memory_allocated() / 1e9)
+shard_dir = f"{out_dir}/partial"
+os.makedirs(shard_dir, exist_ok=True)
+shard_path = lambda s0: f"{shard_dir}/shard_{s0:05d}.pt"
+t_prior = t_cap = t_unclip = 0.0
+n_resumed = 0
+resize256 = transforms.Resize((256, 256))
 
-# ---- save (upstream format) ----
-imsize = 256
-all_recons = transforms.Resize((imsize, imsize))(torch.vstack(all_recons)).float()
+for s0 in range(0, n, args.shard_size):
+    if args.resume and os.path.exists(shard_path(s0)):
+        n_resumed += len(uniq_run[s0:s0 + args.shard_size])
+        print(f"shard {s0} already done, skipping", flush=True)
+        continue
+    sh = {k: [] for k in ["recons", "blurry", "clipvoxels", "prior_out", "betas_avg"]}
+    sh["predcaptions"] = []
+    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
+        for uniq_img in tqdm(uniq_run[s0:s0 + args.shard_size], desc=f"shard {s0}"):
+            locs = np.where(test_images_idx == uniq_img)[0]
+            if len(locs) == 1:
+                locs = locs.repeat(3)
+            elif len(locs) == 2:
+                locs = locs.repeat(2)[:3]
+            assert len(locs) == 3
+            voxel_cpu = test_voxels[None, locs]  # 1, 3 reps, num_voxels
+            sh["betas_avg"].append(torch.mean(voxel_cpu, dim=1))  # same averaging as final_evaluations.ipynb
+            voxel = voxel_cpu.to(device)
+
+            for rep in range(3):
+                backbone0, clip_voxels0, blurry_image_enc0 = model.backbone(model.ridge(voxel[:, [rep]], 0))
+                if rep == 0:
+                    clip_voxels, backbone, blurry_image_enc = clip_voxels0, backbone0, blurry_image_enc0[0]
+                else:
+                    clip_voxels += clip_voxels0
+                    backbone += backbone0
+                    blurry_image_enc += blurry_image_enc0[0]
+            clip_voxels /= 3
+            backbone /= 3
+            blurry_image_enc /= 3
+            sh["clipvoxels"].append(clip_voxels.cpu())
+
+            t = time.time()
+            torch.manual_seed(seed * 1000003 + int(uniq_img))
+            prior_out = model.diffusion_prior.p_sample_loop(backbone.shape,
+                                                            text_cond=dict(text_embed=backbone),
+                                                            cond_scale=1., timesteps=20)
+            t_prior += time.time() - t
+            sh["prior_out"].append(prior_out.half().cpu())
+
+            t = time.time()
+            generated_ids = clip_text_model.generate(pixel_values=clip_convert(prior_out), max_length=20)
+            sh["predcaptions"].append(processor.batch_decode(generated_ids, skip_special_tokens=True)[0])
+            t_cap += time.time() - t
+
+            t = time.time()
+            torch.manual_seed(seed * 1000003 + int(uniq_img) + 1)
+            samples = utils.unclip_recon(prior_out[[0]], diffusion_engine, vector_suffix, num_samples=1)
+            sh["recons"].append(resize256(samples.cpu()).float())  # resized per image; same result as resizing at the end
+            t_unclip += time.time() - t
+
+            if args.blurry_recon:
+                blurred_image = (autoenc.decode(blurry_image_enc / 0.18215).sample / 2 + 0.5).clamp(0, 1)
+                sh["blurry"].append(resize256(blurred_image.cpu()).float())
+    torch.save({k: (torch.vstack(v) if k != "predcaptions" else v) for k, v in sh.items() if len(v)}, shard_path(s0) + ".tmp")
+    os.replace(shard_path(s0) + ".tmp", shard_path(s0))  # a shard file exists only if complete
+    print(f"saved shard {s0}-{s0 + len(sh['predcaptions']) - 1}; first captions: {sh['predcaptions'][:3]}", flush=True)
+
+n_done = n - n_resumed
+print(f"per image (this run, {n_done} images): prior {t_prior / max(n_done, 1):.2f}s, caption {t_cap / max(n_done, 1):.2f}s, unCLIP {t_unclip / max(n_done, 1):.2f}s", flush=True)
+print("peak GPU mem GB:", torch.cuda.max_memory_allocated() / 1e9)
+stage("inference done")
+
+# ---- assemble shards and save (upstream format, plus extras) ----
+shards = [torch.load(shard_path(s0), weights_only=False) for s0 in range(0, n, args.shard_size)]
+cat = lambda k: torch.vstack([sh[k] for sh in shards])
+all_recons = cat("recons")
+all_predcaptions = np.array([c for sh in shards for c in sh["predcaptions"]])
+assert len(all_recons) == len(all_predcaptions) == n
 print(all_recons.shape)
 if args.blurry_recon:
-    torch.save(transforms.Resize((imsize, imsize))(torch.vstack(all_blurryrecons)).float(), f"{out_dir}/{out_name}_all_blurryrecons.pt")
+    torch.save(cat("blurry"), f"{out_dir}/{out_name}_all_blurryrecons.pt")
 torch.save(all_recons, f"{out_dir}/{out_name}_all_recons.pt")
 torch.save(all_predcaptions, f"{out_dir}/{out_name}_all_predcaptions.pt")
-torch.save(torch.vstack(all_clipvoxels), f"{out_dir}/{out_name}_all_clipvoxels.pt")
-torch.save(torch.vstack(all_priorout), f"{out_dir}/{out_name}_all_priorout.pt")
+torch.save(cat("clipvoxels"), f"{out_dir}/{out_name}_all_clipvoxels.pt")
+torch.save(cat("prior_out"), f"{out_dir}/{out_name}_all_prior_out.pt")
+torch.save(cat("betas_avg"), f"{out_dir}/{out_name}_test_betas_avg.pt")
 np.save(f"{out_dir}/{out_name}_image_idx.npy", uniq_run)
+
+
+# ---- run record ----
+def _git(*a):
+    try:
+        return subprocess.run(["git", "-C", os.path.dirname(os.path.dirname(os.path.abspath(__file__))), *a],
+                              capture_output=True, text=True).stdout.strip()
+    except Exception:
+        return None
+
+
+ckpt_paths = {"mindeye2_last": ckpt_file, "unclip": unclip_ckpt, "bigG_openclip": args.bigg_safetensors,
+              "bigG_to_L": f"{cache_dir}/bigG_to_L_epoch8.pth", "betas": f'{data_path}/betas_all_subj0{subj}_fp32_renorm.hdf5'}
+record = {
+    "out_name": out_name, "model_name": args.model_name, "subj": subj, "n_images": int(n), "n_resumed_from_shards": int(n_resumed),
+    "seed": seed, "seed_rule": "torch.manual_seed(seed*1000003 + coco_idx) before the diffusion prior; seed*1000003 + coco_idx + 1 before unCLIP",
+    "unclip_sampler_steps": 38, "prior_timesteps": 20, "prior_cond_scale": 1.0, "unclip_offset_noise_level": 0.04,
+    "blurry_recon": args.blurry_recon, "recon_resolution": 256,
+    "precision": "model weights fp32; torch.cuda.amp.autocast(dtype=float16); TF32 matmul enabled",
+    "attention": "unCLIP spatial_transformer_attn_type=softmax, first-stage attn_type=vanilla (PyTorch attention)",
+    "checkpoints": {k: {"path": v, "bytes": os.path.getsize(v)} for k, v in ckpt_paths.items()},
+    "versions": {p: md.version(p) for p in ["torch", "torchvision", "diffusers", "transformers", "open-clip-torch", "numpy", "h5py"]},
+    "git_commit": _git("rev-parse", "HEAD"), "git_dirty": bool(_git("status", "--porcelain")),
+    "date": datetime.datetime.now().isoformat(timespec="seconds"), "gpu": torch.cuda.get_device_name(0),
+    "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+    "timings_s": {**stage_times, "prior_total": round(t_prior, 1), "caption_total": round(t_cap, 1), "unclip_total": round(t_unclip, 1)},
+    "peak_gpu_mem_gb": round(torch.cuda.max_memory_allocated() / 1e9, 1), "order_check_passed": order_ok,
+}
+with open(f"{out_dir}/{out_name}_run_record.json", "w") as fj:
+    json.dump(record, fj, indent=1)
+for s0 in range(0, n, args.shard_size):
+    os.remove(shard_path(s0))
+os.rmdir(shard_dir)
 print(f"saved {out_name} outputs to {out_dir}")
