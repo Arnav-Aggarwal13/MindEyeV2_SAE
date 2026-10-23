@@ -1,6 +1,6 @@
 wandb/
 train_logs/
-slurms/
+slurm/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -1,0 +1,70 @@
+EVALUATION OF THE MINDEYE2 AUTHORS' SAVED RECONSTRUCTIONS (SUBJECT 1)
+======================================================================
+Date run:        2026-10-22
+Script:          src/interp/eval_recons.py   (port of the image + brain parts of src/final_evaluations.ipynb)
+Job:             Slurm 26600990, node3504, NVIDIA L40S, 3 min 39 s, exit code 0, no metric failed
+Repo commit:     8b7984d (the eval scripts were uncommitted at run time)
+Raw outputs:     ~/orcd/scratch/mindeye/outputs/eval_authors_recons/  (metrics.json, metrics.csv, per_image.npz)
+
+WHAT WAS EVALUATED
+- File: evals/final_subj01_pretrained_40sess_24bs/final_subj01_pretrained_40sess_24bs_all_recons.pt
+  (from the MindEye2 HuggingFace dataset; the authors' REGULAR unCLIP reconstructions, no SDXL refinement)
+- Checkpoint behind them: final_subj01_pretrained_40sess_24bs (subject 1, pretrained on other subjects, finetuned on 40 sessions)
+- Shape (1000, 3, 256, 256), float32, values in [0, 1]. One reconstruction per unique test image, 1000 images.
+- Ground truth: evals/all_images.pt (1000 test images, upsampled from 224 to 256 px like the notebook does).
+- Brain ground truth: subject 1 test betas averaged over the 3 repetitions of each image
+  (base/base_test_betas_avg.pt; same selection and averaging as the eval notebook).
+- Row order: rows of all_images.pt are in sorted unique-test-image order (verified separately, max pixel difference 0.0).
+  The authors' recons are assumed to follow the same order, as in the upstream notebook (not independently verified).
+
+RESULTS (all 1000 images; "higher" = better unless noted)
+----------------------------------------------------------------------
+Low-level image similarity (reconstruction vs its own original)
+  PixCorr               0.3247   higher better   Pearson r between raw pixels (both resized to 425x425, RGB flattened), mean over images
+  SSIM                  0.4102   higher better   structural similarity on grayscale 425x425, Gaussian window sigma 1.5.
+                                                 "upstream-compatible" variant: channel_axis=-1 on the 2-D grayscale array,
+                                                 which I believe reproduces what the notebook's removed multichannel=True did
+                                                 (each image column treated as a channel, so a 1-D SSIM along rows). See NOTE 1.
+  SSIM_2d               0.3326   higher better   standard 2-D SSIM, same settings otherwise
+
+Mid / high-level image similarity (two-way identification; chance = 0.50)
+  For each reconstruction: is its feature vector more correlated with its own original than with each of the other 999 originals?
+  Score = fraction of the 999 distractors beaten, averaged over images.
+  AlexNet(2)            0.9718   higher better   early features (after conv2+ReLU, features.4), spatial maps kept
+  AlexNet(5)            0.9943   higher better   mid features (after conv5+ReLU, features.11), spatial maps kept
+  InceptionV3           0.9680   higher better   2048-d pooled features (object / scene content, position-invariant)
+  CLIP                  0.9489   higher better   OpenAI CLIP ViT-L/14 image embedding (independent of the LAION bigG used by MindEye2)
+
+Feature distances (1 - Pearson correlation between pooled features of reconstruction and original; chance ~ 1.0)
+  EffNet-B              0.6107   LOWER better    EfficientNet-B1 pooled features
+  SwAV                  0.3329   LOWER better    SwAV ResNet50 pooled features
+
+Brain-space correlation (GNet image->fMRI encoding model predicts the voxel response to each reconstruction;
+per image, Pearson r across the voxels of a region between measured and predicted betas; mean over images)
+  nsd_general           0.3861   higher better   all nsd_general voxels
+  V1                    0.4061   higher better
+  V2                    0.3986   higher better
+  V3                    0.3816   higher better
+  V4                    0.3486   higher better
+  higher_vis            0.3651   higher better   (capped by GNet's own accuracy in each region)
+
+TESTS NOT RUN, AND WHY
+- Retrieval (forward / backward image<->brain): needs *_all_clipvoxels.pt, which the authors do not publish.
+- Caption metrics (METEOR, ROUGE, MiniLM, CLIP-B, CLIP-L text similarity): need *_all_predcaptions.pt, not published.
+- UMAP plots: need prior_out / backbone / clipvoxels files, not published.
+- Enhanced-recon blending (recons*0.75 + blurry*0.25): not applicable; we evaluate regular recons only and the authors' blurry recons are not published.
+These can be run on our own base-run outputs, which contain clipvoxels, captions and prior_out.
+
+NOTES
+1. SSIM: the notebook calls structural_similarity(..., multichannel=True), an argument removed in scikit-image >= 0.21 (we have 0.22).
+   The two reported values differ a lot (0.410 vs 0.333). I could not run the old scikit-image to confirm which one the notebook
+   actually computed. Indirect evidence: the notebook's saved output for the authors' ENHANCED recons shows SSIM 0.439, closer to
+   the "SSIM" variant than to SSIM_2d. Treat "SSIM" as the number comparable to published values and SSIM_2d as the standard definition.
+2. Reference point (not a like-for-like comparison): the outputs saved inside the upstream notebook are for the authors' ENHANCED recons:
+   PixCorr 0.374, SSIM 0.439, AlexNet(2) 0.9791, AlexNet(5) 0.9911, InceptionV3 0.9600, CLIP 0.9369, EffNet-B 0.6075, SwAV 0.3363.
+   Our numbers for the regular recons are lower on PixCorr and SSIM (as expected when the SDXL refinement and blurry blending are absent)
+   and similar elsewhere (higher on AlexNet(5), InceptionV3, CLIP; slightly lower on AlexNet(2)). I have not checked the paper's table
+   for the regular-recon numbers.
+3. The next fidelity check is to run this same script on our own base-run recons (base/base_all_recons.pt) and compare them with these
+   numbers. Differences are expected from sampling noise (see the GPU-dependent random-number issue noted earlier).
+4. No confidence intervals are given here; per-image values for every metric are in per_image.npz so paired comparisons can be made.

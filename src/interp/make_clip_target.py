@@ -27,6 +27,8 @@ parser.add_argument("--bigg_safetensors", type=str, required=True, help="local o
 parser.add_argument("--out_dir", type=str, required=True)
 parser.add_argument("--out_name", type=str, default="base")
 parser.add_argument("--batch_size", type=int, default=50)
+parser.add_argument("--pm1", action="store_true", help="diagnostic variant: feed 2x-1 images so the embedder's (x+1)/2 yields a proper [0,1]; "
+                    "saves <out_name>_clip_target_pm1.pt")
 args = parser.parse_args()
 
 device = torch.device("cuda")
@@ -37,6 +39,9 @@ os.makedirs(out_dir, exist_ok=True)
 all_images = torch.load(f"{args.data_path}/evals/all_images.pt", map_location="cpu", weights_only=False)
 print("all_images", tuple(all_images.shape), all_images.dtype, f"range [{all_images.min():.3f}, {all_images.max():.3f}]")
 assert all_images.ndim == 4 and all_images.shape[1:] == (3, 224, 224)
+suffix = "_pm1" if args.pm1 else ""
+if args.pm1:
+    all_images = 2 * all_images - 1
 
 # open_clip 2.24 cannot read .safetensors; let it (same shim as recon_infer.py)
 import open_clip.factory as _oc_factory
@@ -74,5 +79,5 @@ assert torch.isfinite(clip_target.float()).all()  # fp16 cast must not overflow
 
 print(f"clip_target {tuple(clip_target.shape)} {clip_target.dtype}: mean {clip_target.float().mean():.4f} std {clip_target.float().std():.4f} "
       f"per-token L2 norm mean {clip_target.float().norm(dim=-1).mean():.2f}")
-torch.save(clip_target, f"{out_dir}/{args.out_name}_clip_target.pt")
-print(f"saved {out_dir}/{args.out_name}_clip_target.pt")
+torch.save(clip_target, f"{out_dir}/{args.out_name}_clip_target{suffix}.pt")
+print(f"saved {out_dir}/{args.out_name}_clip_target{suffix}.pt")

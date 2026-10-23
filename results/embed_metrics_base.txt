@@ -1,0 +1,65 @@
+EMBEDDING-LEVEL METRICS, BASE RUN (PRETRAINED MINDEYE2, SUBJECT 1, 1000 TEST IMAGES)
+====================================================================================
+Date run:  2026-10-23. Script: src/interp/embed_metrics.py. Job: Slurm 26682312 (CPU, 34 s).
+Raw:       ~/orcd/scratch/mindeye/outputs/base/embed_metrics/base.json, base_per_item.npz (per-image ranks and similarities)
+Tensors:   brain side = base_all_prior_out.pt (diffusion-prior output, one sample, sampled on an L40S) and base_all_clipvoxels.pt
+           (upstream's retrieval embedding); image side = base_clip_target.pt (bigG token embedding of the test image, the "as trained"
+           preprocessing). All (1000, 256, 1664) fp16, rows in sorted unique-test-image order.
+
+HOW RETRIEVAL IS COMPUTED
+Embeddings are flattened (425,984 numbers) and L2-normalized. S[i, j] = cosine(brain embedding i, image embedding j); the correct match is
+the diagonal.
+  brain_to_image: for brain embedding i, is image i the highest-scoring image?  (argmax over each row)
+  image_to_brain: for image j, is brain embedding j the highest-scoring brain embedding?  (argmax over each column)
+Two protocols: "all-1000" = every brain embedding vs all 1000 images (chance 0.1 %), with bootstrap 95 % CIs over images;
+"300x30" = upstream's protocol, 30 random draws of 300 images (chance 0.33 %), mean top-1 with a normal 95 % CI over the 30 draws
+(optimistic, the draws overlap). "centered" = each side first minus its own per-token mean over the 1000 images (not in upstream).
+Mean rank is 1-based (1 = always first).
+
+RESULTS
+                                              prior_out vs clip_target      clip_voxels vs clip_target
+                                              raw        centered           raw        centered
+  brain_to_image  all-1000 top-1             0.796      0.826              0.997      0.996
+                  all-1000 top-5             0.941      0.950              1.000      1.000
+                  all-1000 mean rank         2.09       1.75               1.00       1.00
+                  all-1000 MRR               0.860      0.883              0.9985     0.9978
+                  300x30 top-1               0.880      0.900              0.9991     0.9988
+  image_to_brain  all-1000 top-1             0.859      0.866              0.999      0.998
+                  all-1000 top-5             0.977      0.977              1.000      1.000
+                  all-1000 mean rank         1.45       1.44               1.00       1.00
+                  all-1000 MRR               0.911      0.917              0.9995     0.9990
+                  300x30 top-1               0.931      0.937              0.9998     0.9994
+  95 % CI, prior_out raw all-1000 top-1:  brain_to_image [0.770, 0.821], image_to_brain [0.837, 0.879]
+  95 % CI, prior_out raw 300x30 top-1:    brain_to_image [0.875, 0.886], image_to_brain [0.926, 0.936]
+
+SIMILARITY OF prior_out TO clip_target
+  mean flat cosine (matching image)         0.4173   (centered 0.1957)
+  mean per-token cosine                     0.4129   (centered 0.1973)
+  mean cosine to non-matching images        0.2764   (centered -0.0002)
+  relative squared error (SSE / ||target||^2), mean over images   1.191
+  squared error / variance of the target around its per-token mean over images   1.586
+  norm ratio (mean token norm of prior_out / of clip_target)       1.020
+  (clip_voxels is a different, contrastively trained space: cosine to clip_target 0.069, norm ratio 0.604; these are not meaningful there.)
+
+READING THE RESULTS
+1. Sanity check passed: our clip_voxels retrieval reproduces upstream's protocol. Upstream's notebook output (authors' run) is 0.9996 and
+   0.9987 in its two directions; ours are 0.9998 (image_to_brain) and 0.9991 (brain_to_image). The pairing of directions matches the
+   "upstream labels are swapped" note, but both numbers are so close to 1 that this is only weak evidence for it.
+2. prior_out is far less retrievable than clip_voxels (79.6 % vs 99.7 % brain_to_image among 1000), as expected: it is a single noisy
+   diffusion sample trained to regress clip_target, while clip_voxels is trained contrastively. It is still strongly image-specific
+   (chance 0.1 %; top-5 94 %).
+3. Direction matters: image_to_brain is higher than brain_to_image for prior_out (85.9 % vs 79.6 % top-1). Likely because a brain embedding
+   that happens to lie close to many images has to win against them all in one direction but not the other (hubness); not tested further.
+4. Centering helps retrieval a little for prior_out (79.6 -> 82.6 % brain_to_image) and exposes that much of the raw cosine is a shared
+   component: non-matching images score 0.276 raw but 0.000 centered, and the matching cosine drops from 0.417 to 0.196. The
+   image-specific similarity is therefore about 0.2.
+5. prior_out is not close to clip_target in the squared-error sense: SSE is 1.59 x the variance of the target, i.e. worse than predicting the
+   per-token mean embedding. This is probably because prior_out is one noisy sample. This is NOT directly comparable to an SAE's
+   reconstruction nmse (SAE(x) vs x, where the same x is compared); do not mix the two.
+6. The "paired differences vs prior_out" section in base.json compares clip_voxels with prior_out and is not meaningful; it exists for later
+   SAE conditions (sae_pre(prior_out), sae_ft(prior_out)).
+
+NOT DONE
+- No backbone row: the base run did not save backbone (a 15-min GPU collection rerun would add it).
+- No SAE conditions yet; the script takes any (N, 256, 1664) tensor files as extra --brain / --image arguments.
+- The single prior_out sample was drawn on one GPU type; sampling noise across seeds was not measured.

@@ -2,6 +2,7 @@
 #SBATCH -J mindeye-base
 #SBATCH -p mit_normal_gpu
 #SBATCH --gres=gpu:1
+#SBATCH --exclude=node3006   # CUDA init fails on this node (seen twice)
 #SBATCH -c 8
 #SBATCH --mem=96G
 #SBATCH -t 04:00:00
